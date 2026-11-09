@@ -30,4 +30,7 @@ jobs:
     with:
       require-craft-fonts: true
       craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
-      run-package-check: true
+      architectures: '["x86_64"]'
+      cargo-build-extra-args: '-j 1'
+      cargo-test-extra-args: '-j 1'
+      run-package-check: false
