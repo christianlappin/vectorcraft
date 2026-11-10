@@ -19,7 +19,7 @@
 //! shape that a Convert to Shape or Outline Object effect on them gives them, below or above the
 //! image as its Contents row says; new ones go right below that row.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{Value, json};
 use vectorcraft_color::{BlendMode, Paint};
@@ -126,7 +126,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Eyedropper",
             [],
             None,
-            "{source: id, ids?, pickUp?, apply? (trees as eyedropper.setOptions, merged over the Eyedropper Options for this call), reverse?: bool, append?: bool, defaultsOnly?: bool} copy the attributes both picked up and applied (by default the whole appearance stack, opacity and blend mode, and from type to type the character and paragraph attributes) from `source` to ids (default: highlighted characters while editing type, after Select All in a frame of threaded text the text of the story's frames, leaving out `source`, otherwise the object selection; highlighted characters reject enabled non-neutral object transparency), the fill, stroke and weight also to the paint defaults; `defaultsOnly` updates only paint defaults and cannot be combined with ids, reverse or append; `reverse` (Alt-click) copies from the first selected object (or ids) onto `source` instead, or with nothing selected what the Eyedropper picked up last (a click without Alt); `append` (Shift+Alt-click) adds the source's fills, strokes and effects on top of each target's stack; placed gradients land at the same place relative to each target's bounds (defaults: fitted to new art); with an object of a dynamic symbol instance selected by Direct Selection and no ids, reverse, append or defaultsOnly, that object takes the source's fill and stroke (solid, none, gradient or pattern) for this instance only, as the Eyedropper Options allow, and a source that is not a path, compound path or type, or options that pick up neither color, are refused. On a path directly in a graph series, the graph also stores the paint, weight, opacity and blend mode of the topmost visible fill and stroke and the object's opacity and blend mode (exceptions: docs/mcp.md) → {ids}",
+            "{source: id, ids?, pickUp?, apply? (trees as eyedropper.setOptions, merged over the Eyedropper Options for this call), reverse?: bool, append?: bool, defaultsOnly?: bool} copy the attributes both picked up and applied (by default the whole appearance stack, opacity and blend mode, and from type to type the character and paragraph attributes using effective character dimensions while preserving target transforms) from `source` to ids (default: highlighted characters while editing type, after Select All in a frame of threaded text the text of the story's frames, leaving out `source`, otherwise the object selection; highlighted characters reject enabled non-neutral object transparency), the fill, stroke and weight also to the paint defaults; `defaultsOnly` updates only paint defaults and cannot be combined with ids, reverse or append; `reverse` (Alt-click) copies from the first selected object (or ids) onto `source` instead, or with nothing selected what the Eyedropper picked up last (a click without Alt); `append` (Shift+Alt-click) adds the source's fills, strokes and effects on top of each target's stack; placed gradients land at the same place relative to each target's bounds (defaults: fitted to new art); with an object of a dynamic symbol instance selected by Direct Selection and no ids, reverse, append or defaultsOnly, that object takes the source's fill and stroke (solid, none, gradient or pattern) for this instance only, as the Eyedropper Options allow, and a source that is not a path, compound path or type, or options that pick up neither color, are refused. On a path directly in a graph series, the graph also stores the paint, weight, opacity and blend mode of the topmost visible fill and stroke and the object's opacity and blend mode (exceptions: docs/mcp.md) → {ids}",
             has_doc,
             copy_from
         ),
@@ -1193,7 +1193,7 @@ fn target_contents(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() }))
 }
 
-/// Sample enabled attributes, refusing object transparency that a text range cannot store.
+/// Sample enabled attributes with transform-aware character dimensions and atomic validation.
 fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "appearance.copyFrom";
     let clicked = id_param(p, "source").ok_or_else(|| bad(C, "missing `source` id"))?;
@@ -1265,9 +1265,6 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.eyedropper_sample.clone().ok_or_else(|| bad(C, "select the object to copy from"))?,
     };
     let picked = Picked::of(&node);
-    if !reverse && !defaults_only {
-        s.eyedropper_sample = Some(node);
-    }
     // The highlighted characters' type objects and ranges: after Select All in threaded text, all
     // the text of every frame of the story, except a frame the attributes come from, in place of
     // the object selection.
@@ -1279,6 +1276,15 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Some((id, start, end)) if targets.contains(&id) => vec![(id, Some((start, end)))],
         _ => vec![],
+    };
+    // Prepare every dimensional copy before changing defaults or the remembered sample. A bad
+    // source or target transform must refuse the entire pick, including a multi-frame range.
+    let characters = if attrs.character && !append {
+        let d = &s.doc()?.doc;
+        let ids = targets.iter().copied().filter(|_| ranges.is_empty()).chain(ranges.iter().map(|(id, _)| *id));
+        copied_character_styles(&node, ids.filter_map(|id| d.node(id)))?
+    } else {
+        HashMap::new()
     };
     // Character styles cannot represent object transparency. Refuse before even changing
     // paint defaults; applying it to the object would also alter the unselected characters.
@@ -1292,6 +1298,9 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
                 ));
             }
         }
+    }
+    if !reverse && !defaults_only {
+        s.eyedropper_sample = Some(node);
     }
     if !reverse {
         picked.to_defaults(s, &attrs.appearance);
@@ -1307,7 +1316,7 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
                 let Some(NodeKind::Text(t)) = d.node_mut(id).map(|n| &mut n.kind) else { return Err(EngineError::NoNode(id)) };
                 let (start, end) = range.unwrap_or((0, vectorcraft_text::edit::runs_len(&t.runs)));
                 let placed = picked.placed(Some(t.local_bounds()));
-                vectorcraft_text::edit::style_range(&mut t.runs, start, end, |st| picked.run(st, &placed, &attrs));
+                vectorcraft_text::edit::style_range(&mut t.runs, start, end, |st| Picked::run(st, &placed, &attrs, characters.get(&id)));
                 if let Some((_, para)) = picked.text.as_ref().filter(|_| attrs.paragraph) {
                     t.edit_paras(Some(t.paragraphs_in(start, end)), |p| *p = para.clone());
                 }
@@ -1322,7 +1331,7 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
     super::overprint::edit_counted(s, "Eyedropper", |d| {
         for id in &targets {
             if let Some(n) = d.node_mut(*id) {
-                picked.apply(n, &attrs, append);
+                picked.apply(n, &attrs, append, characters.get(id));
             }
         }
         // The paints the pick wrote, with a weight going with the paint of its stroke, as in `set_item`. `append` adds
@@ -1365,6 +1374,58 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(count_changed(d, &before, &targets) + usize::from(kept || painted || object))
     })?;
     Ok(json!({ "ids": targets.iter().map(|i| i.0).collect::<Vec<_>>() }))
+}
+
+/// Read source typography in document space, then compensate for each target's transform.
+/// Paint stays in its existing sampling path; character scale never changes object placement.
+fn copied_character_styles<'a>(source: &Node, targets: impl Iterator<Item = &'a Node>) -> Result<HashMap<NodeId, CharStyle>> {
+    const C: &str = "appearance.copyFrom";
+    let mut styles = HashMap::new();
+    let NodeKind::Text(source) = &source.kind else { return Ok(styles) };
+    let Some(run) = source.runs.first() else { return Ok(styles) };
+    let mut targets = targets
+        .filter_map(|n| match &n.kind {
+            NodeKind::Text(t) => Some((n.id, t)),
+            _ => None,
+        })
+        .peekable();
+    if targets.peek().is_none() {
+        return Ok(styles);
+    }
+    let effective = source.effective_char_style(&run.style).ok_or_else(|| bad(C, "source text transform is collapsed or unrepresentable"))?;
+    if !copied_dimensions_fit(&run.style, &effective) {
+        return Err(bad(C, "character dimensions cannot be represented with the source text transform"));
+    }
+    for (id, text) in targets {
+        let scale = text.style_scale().ok_or_else(|| bad(C, "target text transform is collapsed or unrepresentable"))?;
+        let mut local = effective.clone();
+        local.size /= scale.points;
+        local.leading = local.leading.map(|v| v / scale.points);
+        local.baseline_shift /= scale.points;
+        local.tcy_up_down /= scale.points;
+        local.tcy_left_right /= scale.points;
+        local.h_scale /= scale.horizontal;
+        // As with dimensional type commands, reject overflow and underflow before layout.
+        if !copied_dimensions_fit(&effective, &local) {
+            return Err(bad(C, "character dimensions cannot be represented with the target text transform"));
+        }
+        styles.insert(id, local);
+    }
+    Ok(styles)
+}
+
+/// Bound each converted type dimension and refuse loss to zero before layout reads it.
+fn copied_dimensions_fit(from: &CharStyle, to: &CharStyle) -> bool {
+    [
+        (from.size, to.size),
+        (from.leading.unwrap_or(0.0), to.leading.unwrap_or(0.0)),
+        (from.baseline_shift, to.baseline_shift),
+        (from.tcy_up_down, to.tcy_up_down),
+        (from.tcy_left_right, to.tcy_left_right),
+        (from.h_scale, to.h_scale),
+    ]
+    .iter()
+    .all(|(from, to)| to.is_finite() && to.abs() <= crate::MAX_COORD && (*from == 0.0 || *to != 0.0))
 }
 
 /// What the Eyedropper picks up from an object.
@@ -1417,8 +1478,8 @@ impl Picked {
 
     /// Copy character attributes and the enabled paint attributes through the same path for
     /// whole text objects and highlighted character ranges.
-    fn run(&self, st: &mut CharStyle, placed: &Appearance, a: &EyedropperAttrs) {
-        if let Some((cs, _)) = self.text.as_ref().filter(|_| a.character) {
+    fn run(st: &mut CharStyle, placed: &Appearance, a: &EyedropperAttrs, character: Option<&CharStyle>) {
+        if let Some(cs) = character {
             *st = CharStyle {
                 fill: std::mem::take(&mut st.fill),
                 stroke: std::mem::take(&mut st.stroke),
@@ -1434,7 +1495,7 @@ impl Picked {
     /// Apply attributes `a` to `n`. `append` adds the fills and strokes (and effects) on top of its
     /// stack instead. Type takes the paints on its characters, and character and paragraph
     /// attributes from type.
-    fn apply(&self, n: &mut Node, a: &EyedropperAttrs, append: bool) {
+    fn apply(&self, n: &mut Node, a: &EyedropperAttrs, append: bool, character: Option<&CharStyle>) {
         let ap = &a.appearance;
         if ap.transparency {
             n.opacity = self.opacity;
@@ -1451,7 +1512,7 @@ impl Picked {
             let placed = self.placed(Some(t.local_bounds()));
             let text = self.text.as_ref();
             for r in &mut t.runs {
-                self.run(&mut r.style, &placed, a);
+                Self::run(&mut r.style, &placed, a, character);
             }
             if let Some((_, para)) = text.filter(|_| a.paragraph) {
                 // The source's first paragraph's attributes, on every paragraph.
