@@ -24,9 +24,13 @@ jobs:
       # Same craft-fonts commit as release.yml.
       craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
       os: '["windows-latest"]'
+      command: >-
+        cargo test --locked -p vectorcraft-engine --lib tests::eyedropper &&
+        cargo test --locked -p vectorcraft-engine --lib tests::typescale
       dev-debug: "0"
       env: |
         CARGO_BUILD_JOBS=2
+        CARGO_PROFILE_TEST_OPT_LEVEL=0
       timeout-minutes: 120
       packages: >-
         pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
